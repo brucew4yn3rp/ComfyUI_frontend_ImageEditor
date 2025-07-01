@@ -999,7 +999,7 @@ class MaskEditorDialog extends ComfyDialog {
       paint: paintCanvas
     })
 
-    replaceImageOutputAndWidget(refs.paintedMaskedImage, [refs.paint])
+    replaceClipspaceImages(refs.paintedMaskedImage, [refs.paint])
 
     const originalImageUrl = new URL(image.src)
 
@@ -1068,7 +1068,7 @@ class MaskEditorDialog extends ComfyDialog {
       this.uploadImage(refs.paint, formDatas.paint)
     )
     const paintedImageUploadStatus = await requestWithRetries(() =>
-      this.uploadImage(refs.paintedImage, formDatas.paintedImage)
+      this.uploadImage(refs.paintedImage, formDatas.paintedImage, false)
     )
 
     // IMPORTANT: why are we using `uploadMask` here?
@@ -1077,7 +1077,11 @@ class MaskEditorDialog extends ComfyDialog {
     // It is possible that WebGL contexts can achieve this, but WebGL is extremely complex, and the backend functionality is here for this purpose!
     // Refer to the backend repo's `server.py`, search for `@routes.post("/upload/mask")`
     const paintedMaskedImageUploadStatus = await requestWithRetries(() =>
-      this.uploadMask(refs.paintedMaskedImage, formDatas.paintedMaskedImage)
+      this.uploadMask(
+        refs.paintedMaskedImage,
+        formDatas.paintedMaskedImage,
+        false
+      )
     )
 
     if (
@@ -1115,7 +1119,12 @@ class MaskEditorDialog extends ComfyDialog {
     return new Blob([arrayBuffer], { type: contentType })
   }
 
-  private async uploadImage(filepath: Ref, formData: FormData, retries = 3) {
+  private async uploadImage(
+    filepath: Ref,
+    formData: FormData,
+    andSaveToClipspace = true,
+    retries = 3
+  ) {
     if (retries <= 0) {
       throw new Error('Max retries reached')
       return
@@ -1128,13 +1137,17 @@ class MaskEditorDialog extends ComfyDialog {
       .then((response) => {
         if (!response.ok) {
           console.log('Failed to upload mask:', response)
-          this.uploadImage(filepath, formData, retries - 1)
+          this.uploadImage(filepath, formData, andSaveToClipspace, retries - 1)
         }
       })
       .catch((error) => {
         console.error('Error:', error)
       })
 
+    if (!andSaveToClipspace) {
+      ClipspaceDialog.invalidatePreview()
+      return
+    }
     try {
       const paintedIndex = ComfyApp.clipspace?.paintedIndex
       if (ComfyApp.clipspace?.imgs && paintedIndex !== undefined) {
@@ -1162,7 +1175,12 @@ class MaskEditorDialog extends ComfyDialog {
     ClipspaceDialog.invalidatePreview()
   }
 
-  private async uploadMask(filepath: Ref, formData: FormData, retries = 3) {
+  private async uploadMask(
+    filepath: Ref,
+    formData: FormData,
+    andSaveToClipspace = true,
+    retries = 3
+  ) {
     if (retries <= 0) {
       throw new Error('Max retries reached')
       return
@@ -1175,13 +1193,17 @@ class MaskEditorDialog extends ComfyDialog {
       .then((response) => {
         if (!response.ok) {
           console.log('Failed to upload mask:', response)
-          this.uploadMask(filepath, formData, retries - 1)
+          this.uploadMask(filepath, formData, andSaveToClipspace, -1)
         }
       })
       .catch((error) => {
         console.error('Error:', error)
       })
 
+    if (!andSaveToClipspace) {
+      ClipspaceDialog.invalidatePreview()
+      return
+    }
     try {
       const selectedIndex = ComfyApp.clipspace?.selectedIndex
       if (ComfyApp.clipspace?.imgs && selectedIndex !== undefined) {
@@ -5407,7 +5429,15 @@ const removeImageRgbValuesAndInvertAlpha = (imageData: Uint8ClampedArray) =>
 
 type Ref = { filename: string; subfolder?: string; type?: string }
 
-const replaceImageOutputAndWidget = (
+/**
+ * Note: the images' positions are important here. As far as I understand what the positions mean is hardcoded in `src/scripts/app.ts` in the `copyToClipspace` method.
+ * - `newMainOutput` should be the fully composited image: base image + mask (in the alpha channel) + paint.
+ * - The first array element of `extraImagesShownButNotOutputted` should be JUST the paint layer, with a transparent background.
+ * - There is code for a second array element, but it is still unclear to me if it is used anywhere useful.
+ * With this configuration, the MaskEditor will properly load the paint layer separately from the base image, ensuring it is editable.
+ * - @duckcomfy
+ * */
+const replaceClipspaceImages = (
   newMainOutput: Ref,
   extraImagesShownButNotOutputted?: Ref[]
 ) => {
@@ -5421,8 +5451,6 @@ const replaceImageOutputAndWidget = (
 
     ComfyApp!.clipspace!.widgets![firstImageWidgetIndex].value = newMainOutput
 
-    // NOTE: I copied this from the original implementation, but I couldn't find out what this actually is used for, and whether this is actually needed. It seems that displaying additional images inside the widget is caused not by this piece of code, but by something else, very likely the upload endpoints. I don't know what else, if anything, this is supposed to do.
-    // @duckcomfy
     extraImagesShownButNotOutputted?.forEach((extraImage, extraImageIndex) => {
       const extraImageWidgetIndex = firstImageWidgetIndex + extraImageIndex + 1
       ComfyApp!.clipspace!.widgets![extraImageWidgetIndex].value = extraImage
