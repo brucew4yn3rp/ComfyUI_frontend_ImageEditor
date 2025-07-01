@@ -1,6 +1,5 @@
 import { debounce } from 'lodash'
-
-import { t } from '@/i18n'
+import _ from 'lodash'
 
 import { api } from '../../scripts/api'
 import { app } from '../../scripts/app'
@@ -942,220 +941,153 @@ class MaskEditorDialog extends ComfyDialog {
   }
 
   async save() {
-    const backupCanvas = document.createElement('canvas')
     const imageCanvas = this.uiManager.getImgCanvas()
     const maskCanvas = this.uiManager.getMaskCanvas()
-    const rgbCanvas = this.uiManager.getrgbCanvas()
+    const maskCanvasCtx = getCanvas2dContext(maskCanvas)
+    const paintCanvas = this.uiManager.getRgbCanvas()
     const image = this.uiManager.getImage()
-    const backupCtx = backupCanvas.getContext('2d', {
-      willReadFrequently: true
-    })
-    const rgbCtx = rgbCanvas.getContext('2d', {
-      willReadFrequently: true
-    })
-
-    backupCanvas.width = imageCanvas.width
-    backupCanvas.height = imageCanvas.height
-
-    if (!backupCtx) {
-      return
-    }
-
-    // Ensure the mask image is fully loaded
-    const maskImageLoaded = new Promise<void>((resolve, reject) => {
-      const maskImage = new Image()
-      maskImage.src = maskCanvas.toDataURL()
-      maskImage.onload = () => {
-        resolve()
-      }
-      maskImage.onerror = (error) => {
-        reject(error)
-      }
-    })
 
     try {
-      await maskImageLoaded
+      await ensureImageFullyLoaded(maskCanvas.toDataURL())
     } catch (error) {
       console.error('Error loading mask image:', error)
       return
     }
 
-    backupCtx.clearRect(0, 0, backupCanvas.width, backupCanvas.height)
-    backupCtx.drawImage(
-      maskCanvas,
+    const unrefinedMaskImageData = maskCanvasCtx.getImageData(
       0,
       0,
       maskCanvas.width,
-      maskCanvas.height,
-      0,
-      0,
-      backupCanvas.width,
-      backupCanvas.height
+      maskCanvas.height
     )
 
-    let maskHasContent = false
-    const maskData = backupCtx.getImageData(
-      0,
-      0,
-      backupCanvas.width,
-      backupCanvas.height
+    const refinedMaskOnlyData = new ImageData(
+      removeImageRgbValuesAndInvertAlpha(unrefinedMaskImageData.data),
+      unrefinedMaskImageData.width,
+      unrefinedMaskImageData.height
     )
 
-    for (let i = 0; i < maskData.data.length; i += 4) {
-      if (maskData.data[i + 3] !== 0) {
-        maskHasContent = true
-        break
-      }
+    // We create an undisplayed copy so as not to alter the original--displayed--canvas
+    const [refinedMaskCanvas, refinedMaskCanvasCtx] =
+      createCanvasCopy(maskCanvas)
+    refinedMaskCanvasCtx.globalCompositeOperation =
+      CompositionOperation.SourceOver
+    refinedMaskCanvasCtx.putImageData(refinedMaskOnlyData, 0, 0)
+
+    const filenames = {
+      maskedImage: 'clipspace-mask-' + performance.now() + '.png',
+      paint: 'clipspace-paint-' + performance.now() + '.png',
+      paintedImage: 'clipspace-painted-' + performance.now() + '.png',
+      paintedMaskedImage:
+        'clipspace-painted-masked-' + performance.now() + '.png'
     }
 
-    // paste mask data into alpha channel
-    const backupData = backupCtx.getImageData(
-      0,
-      0,
-      backupCanvas.width,
-      backupCanvas.height
-    )
-
-    let backupHasContent = false
-    for (let i = 0; i < backupData.data.length; i += 4) {
-      if (backupData.data[i + 3] !== 0) {
-        backupHasContent = true
-        break
-      }
-    }
-
-    if (maskHasContent && !backupHasContent) {
-      console.error('Mask appears to be empty')
-      alert('Cannot save empty mask')
-      return
-    }
-
-    // refine mask image
-    for (let i = 0; i < backupData.data.length; i += 4) {
-      const alpha = backupData.data[i + 3]
-      backupData.data[i] = 0
-      backupData.data[i + 1] = 0
-      backupData.data[i + 2] = 0
-      backupData.data[i + 3] = 255 - alpha
-    }
-
-    backupCtx.globalCompositeOperation = CompositionOperation.SourceOver
-    backupCtx.putImageData(backupData, 0, 0)
-
-    const formData = new FormData()
-    const filename = 'clipspace-mask-' + performance.now() + '.png'
-
-    const rgbFormData = new FormData()
-    const rgbFilename = 'clipspace-paint-' + performance.now() + '.png'
-
-    const item = {
-      filename: filename,
+    const toRef = (filename: string): Ref => ({
+      filename,
       subfolder: 'clipspace',
       type: 'input'
+    })
+    const refs = {
+      maskedImage: toRef(filenames.maskedImage),
+      paint: toRef(filenames.paint),
+      paintedImage: toRef(filenames.paintedImage),
+      paintedMaskedImage: toRef(filenames.paintedMaskedImage)
     }
 
-    const rgbItem = {
-      filename: rgbFilename,
-      subfolder: 'clipspace',
-      type: 'input'
-    }
+    const [paintedImageCanvas] = combineOriginalImageAndPaint({
+      originalImage: imageCanvas,
+      paint: paintCanvas
+    })
 
-    if (ComfyApp?.clipspace?.widgets?.length) {
-      const index = ComfyApp.clipspace.widgets.findIndex(
-        (obj) => obj?.name === 'image'
-      )
-      const rgbindex = index + 1
+    replaceImageOutputAndWidget(refs.paintedMaskedImage, [refs.paint])
 
-      if (index >= 0 && item !== undefined) {
-        try {
-          ComfyApp.clipspace.widgets[index].value = item
-          ComfyApp.clipspace.widgets[rgbindex].value = rgbItem
-        } catch (err) {
-          console.warn('Failed to set widget value:', err)
-        }
-      }
-    }
-
-    const dataURL = backupCanvas.toDataURL()
-    const blob = this.dataURLToBlob(dataURL)
-
-    const rgbURL = rgbCanvas.toDataURL()
-    const rgbBlob = this.dataURLToBlob(rgbURL)
-
-    let original_url = new URL(image.src)
-
-    type Ref = { filename: string; subfolder?: string; type?: string }
+    const originalImageUrl = new URL(image.src)
 
     this.uiManager.setBrushOpacity(0)
 
-    const filenameRef = original_url.searchParams.get('filename')
-    if (!filenameRef) {
-      throw new Error('filename parameter is required')
+    const originalImageFilename = originalImageUrl.searchParams.get('filename')
+    if (!originalImageFilename)
+      throw new Error(
+        "Expected original image URL to have a `filename` query parameter, but couldn't find it."
+      )
+
+    const originalImageRef: Partial<Ref> = {
+      filename: originalImageFilename,
+      subfolder: originalImageUrl.searchParams.get('subfolder') ?? undefined,
+      type: originalImageUrl.searchParams.get('type') ?? undefined
     }
-    const original_ref: Ref = {
-      filename: filenameRef
+
+    const mkFormData = (
+      blob: Blob,
+      filename: string,
+      originalImageRefOverride?: Partial<Ref>
+    ) => {
+      const formData = new FormData()
+      formData.append('image', blob, filename)
+      formData.append(
+        'original_ref',
+        JSON.stringify(originalImageRefOverride ?? originalImageRef)
+      )
+      formData.append('type', 'input')
+      formData.append('subfolder', 'clipspace')
+      return formData
     }
 
-    let original_subfolder = original_url.searchParams.get('subfolder')
-    if (original_subfolder) original_ref.subfolder = original_subfolder
+    const canvasToFormData = (
+      canvas: HTMLCanvasElement,
+      filename: string,
+      originalImageRefOverride?: Partial<Ref>
+    ) => {
+      const blob = this.dataURLToBlob(canvas.toDataURL())
+      return mkFormData(blob, filename, originalImageRefOverride)
+    }
 
-    let original_type = original_url.searchParams.get('type')
-    if (original_type) original_ref.type = original_type
-
-    formData.append('image', blob, filename)
-    formData.append('original_ref', JSON.stringify(original_ref))
-    formData.append('type', 'input')
-    formData.append('subfolder', 'clipspace')
-
-    rgbFormData.append('image', rgbBlob, rgbFilename)
-    rgbFormData.append('original_ref', JSON.stringify(original_ref))
-    rgbFormData.append('type', 'input')
-    rgbFormData.append('subfolder', 'clipspace')
+    const formDatas = {
+      // Note: this canvas only contains mask data (no image), but during the upload process, the backend combines the mask with the original_image. Refer to the backend repo's `server.py`, search for `@routes.post("/upload/mask")`
+      maskedImage: canvasToFormData(refinedMaskCanvas, filenames.maskedImage),
+      paint: canvasToFormData(paintCanvas, filenames.paint),
+      paintedImage: canvasToFormData(
+        paintedImageCanvas,
+        filenames.paintedImage
+      ),
+      paintedMaskedImage: canvasToFormData(
+        refinedMaskCanvas,
+        filenames.paintedMaskedImage,
+        refs.paintedImage
+      )
+    }
 
     this.uiManager.setSaveButtonText('Saving')
     this.uiManager.setSaveButtonEnabled(false)
     this.keyboardManager.removeListeners()
 
-    // Retry mechanism
-    const maxRetries = 3
-    let attempt = 0
-    let success = false
+    const maskUploadStatus = await requestWithRetries(() =>
+      this.uploadMask(refs.maskedImage, formDatas.maskedImage)
+    )
+    const paintUploadStatus = await requestWithRetries(() =>
+      this.uploadImage(refs.paint, formDatas.paint)
+    )
+    const paintedImageUploadStatus = await requestWithRetries(() =>
+      this.uploadImage(refs.paintedImage, formDatas.paintedImage)
+    )
 
-    while (attempt < maxRetries && !success) {
-      try {
-        await this.uploadMask(item, formData)
-        success = true
-      } catch (error) {
-        console.error(`Upload attempt ${attempt + 1} failed:`, error)
-        attempt++
-        if (attempt < maxRetries) {
-          console.log('Retrying upload...')
-        } else {
-          console.log('Max retries reached. Upload failed.')
-        }
-      }
-    }
+    // IMPORTANT: why are we using `uploadMask` here?
+    // This is because the backend combines the mask with the painted image during the upload process. We do NOT want to combine the mask with the original image here, because the spec for CanvasRenderingContext2D does not allow for setting pixels to transparent while preserving their RGB values.
+    // See: <https://developer.mozilla.org/en-US/docs/Web/API/CanvasRenderingContext2D/putImageData#data_loss_due_to_browser_optimization>
+    // It is possible that WebGL contexts can achieve this, but WebGL is extremely complex, and the backend functionality is here for this purpose!
+    // Refer to the backend repo's `server.py`, search for `@routes.post("/upload/mask")`
+    const paintedMaskedImageUploadStatus = await requestWithRetries(() =>
+      this.uploadMask(refs.paintedMaskedImage, formDatas.paintedMaskedImage)
+    )
 
-    const paintmaxRetries = 3
-    let paintattempt = 0
-    let paintsuccess = false
-
-    while (paintattempt < paintmaxRetries && !paintsuccess) {
-      try {
-        await this.uploadImage(rgbItem, rgbFormData)
-        paintsuccess = true
-      } catch (error) {
-        console.error(`Paint upload attempt ${attempt + 1} failed:`, error)
-        paintattempt++
-        if (paintattempt < paintmaxRetries) {
-          console.log('Retrying paint upload...')
-        } else {
-          console.log('Max retries reached. Paint upload failed.')
-        }
-      }
-    }
-
-    if (success && paintsuccess) {
+    if (
+      _.every([
+        maskUploadStatus.success,
+        paintUploadStatus.success,
+        paintedImageUploadStatus.success,
+        paintedMaskedImageUploadStatus.success
+      ])
+    ) {
       ComfyApp.onClipspaceEditorSave()
       this.close()
       this.isOpen = false
@@ -1183,11 +1115,7 @@ class MaskEditorDialog extends ComfyDialog {
     return new Blob([arrayBuffer], { type: contentType })
   }
 
-  private async uploadImage(
-    filepath: { filename: string; subfolder: string; type: string },
-    formData: FormData,
-    retries = 3
-  ) {
+  private async uploadImage(filepath: Ref, formData: FormData, retries = 3) {
     if (retries <= 0) {
       throw new Error('Max retries reached')
       return
@@ -1234,11 +1162,7 @@ class MaskEditorDialog extends ComfyDialog {
     ClipspaceDialog.invalidatePreview()
   }
 
-  private async uploadMask(
-    filepath: { filename: string; subfolder: string; type: string },
-    formData: FormData,
-    retries = 3
-  ) {
+  private async uploadMask(filepath: Ref, formData: FormData, retries = 3) {
     if (retries <= 0) {
       throw new Error('Max retries reached')
       return
@@ -4377,7 +4301,7 @@ class UIManager {
     return this.imgCanvas
   }
 
-  getrgbCanvas() {
+  getRgbCanvas() {
     return this.rgbCanvas
   }
 
@@ -5450,3 +5374,108 @@ app.registerExtension({
     )
   }
 })
+
+// NOTE: This originally was re-implemented at each individual call site, which is obviously a poorly-maintainable approach. I moved it to be implemented here once, but this should likely be either be implemented as a project-wide utility, or better yet, we should use a networking library that already has retry logic built-in, such as TanStack Query or axios-retry.
+// - @duckcomfy
+const requestWithRetries = async (
+  mkRequest: () => Promise<void>
+): Promise<{ success: boolean }> => {
+  const maxRetries = 3
+  let attempt = 0
+  let success = false
+  while (attempt < maxRetries && !success) {
+    try {
+      await mkRequest()
+      success = true
+    } catch (error) {
+      console.error(`Upload attempt ${attempt + 1} failed:`, error)
+      attempt++
+      if (attempt < maxRetries) {
+        console.log('Retrying upload...')
+      } else {
+        console.log('Max retries reached. Upload failed.')
+      }
+    }
+  }
+  return { success }
+}
+
+const isAlphaValue = (index: number) => index % 4 === 3
+
+const removeImageRgbValuesAndInvertAlpha = (imageData: Uint8ClampedArray) =>
+  imageData.map((val, i) => (isAlphaValue(i) ? 255 - val : 0))
+
+type Ref = { filename: string; subfolder?: string; type?: string }
+
+const replaceImageOutputAndWidget = (
+  newMainOutput: Ref,
+  extraImagesShownButNotOutputted?: Ref[]
+) => {
+  try {
+    if (!ComfyApp?.clipspace?.widgets?.length) return
+    const firstImageWidgetIndex = ComfyApp.clipspace.widgets.findIndex(
+      (obj) => obj?.name === 'image'
+    )
+    const firstImageWidget = ComfyApp.clipspace.widgets[firstImageWidgetIndex]
+    if (!firstImageWidget) return
+
+    ComfyApp!.clipspace!.widgets![firstImageWidgetIndex].value = newMainOutput
+
+    // NOTE: I copied this from the original implementation, but I couldn't find out what this actually is used for, and whether this is actually needed. It seems that displaying additional images inside the widget is caused not by this piece of code, but by something else, very likely the upload endpoints. I don't know what else, if anything, this is supposed to do.
+    // @duckcomfy
+    extraImagesShownButNotOutputted?.forEach((extraImage, extraImageIndex) => {
+      const extraImageWidgetIndex = firstImageWidgetIndex + extraImageIndex + 1
+      ComfyApp!.clipspace!.widgets![extraImageWidgetIndex].value = extraImage
+    })
+  } catch (err) {
+    console.warn('Failed to set widget value:', err)
+  }
+}
+
+const ensureImageFullyLoaded = (src: string) =>
+  new Promise<void>((resolve, reject) => {
+    const maskImage = new Image()
+    maskImage.src = src
+    maskImage.onload = () => resolve()
+    maskImage.onerror = reject
+  })
+
+const createCanvasCopy = (
+  canvas: HTMLCanvasElement
+): [HTMLCanvasElement, CanvasRenderingContext2D] => {
+  const newCanvas = document.createElement('canvas')
+  const newCanvasCtx = getCanvas2dContext(newCanvas)
+  newCanvas.width = canvas.width
+  newCanvas.height = canvas.height
+  newCanvasCtx.clearRect(0, 0, canvas.width, canvas.height)
+  newCanvasCtx.drawImage(
+    canvas,
+    0,
+    0,
+    canvas.width,
+    canvas.height,
+    0,
+    0,
+    canvas.width,
+    canvas.height
+  )
+  return [newCanvas, newCanvasCtx!]
+}
+
+const getCanvas2dContext = (
+  canvas: HTMLCanvasElement
+): CanvasRenderingContext2D => {
+  const ctx = canvas.getContext('2d', { willReadFrequently: true })
+  // Safe with the way we use canvases
+  if (!ctx) throw new Error('Failed to get 2D context from canvas')
+  return ctx
+}
+
+const combineOriginalImageAndPaint = (
+  canvases: Record<'originalImage' | 'paint', HTMLCanvasElement>
+): [HTMLCanvasElement, CanvasRenderingContext2D] => {
+  const { originalImage, paint } = canvases
+  const [resultCanvas, resultCanvasCtx] = createCanvasCopy(originalImage)
+  resultCanvasCtx.drawImage(paint, 0, 0)
+  return [resultCanvas, resultCanvasCtx]
+}
